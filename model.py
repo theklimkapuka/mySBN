@@ -6,49 +6,14 @@ import torch.nn.functional as F
 
 from .Attention import Attention, Intermediate, Output, Dim_Four_Attention, masked_softmax
 from .data_BIO_loader import sentiment2id, validity2id
-#from allennlp.nn.util import batched_index_select, batched_span_select
+from allennlp.nn.util import batched_index_select, batched_span_select
 import random
 import math
-
-
-def batched_index_select(tensor, index):
-    """
-    Selects elements from the input tensor based on indices specified in the `index` tensor.
-    """
-    views = [tensor.shape[0]] + [1 if i != 1 else -1 for i in range(1, tensor.dim())]
-    expanse = list(tensor.shape)
-    expanse[0], expanse[1] = -1, index.shape[-1]
-
-    index = index.view(views).expand(expanse)
-    return torch.gather(tensor, 1, index)
-
-def batched_span_select(tensor: torch.Tensor, spans: torch.Tensor):
-    batch_size, seq_length, hidden_size = tensor.size()
-    num_spans = spans.size(1)
-    max_span_width = (spans[..., 1] - spans[..., 0] + 1).max().item()
-
-    span_indices = []
-    for i in range(batch_size):
-        batch_indices = []
-        for j in range(num_spans):
-            start, end = spans[i, j]
-            indices = torch.arange(start, end + 1).to(tensor.device)
-            batch_indices.append(indices)
-        span_indices.append(torch.nn.utils.rnn.pad_sequence(batch_indices, batch_first=True, padding_value=-1))
-    
-    span_indices = torch.stack(span_indices)
-    span_mask = (span_indices != -1).unsqueeze(-1).expand(-1, -1, -1, hidden_size)
-    
-    span_indices = span_indices.unsqueeze(-1).expand(-1, -1, -1, hidden_size)
-    selected_spans = tensor.unsqueeze(1).expand(-1, num_spans, -1, -1).gather(2, span_indices)
-    selected_spans = selected_spans * span_mask.float()
-    
-    return selected_spans, span_mask
-
+# what is happening
 
 def stage_2_features_generation(bert_feature, attention_mask, spans, span_mask, spans_embedding, spans_aspect_tensor,
                                 spans_opinion_tensor=None):
-    # 对输入的aspect信息进行处理，去除掉无效的aspect span
+    # Process the input aspect information to remove invalid aspect spans
     all_span_aspect_tensor = None
     all_span_opinion_tensor = None
     all_bert_embedding = None
@@ -148,7 +113,8 @@ class Step_1(torch.nn.Module):
         self.bert_config = bert_config
         self.dropout_output = torch.nn.Dropout(args.drop_out)
         if self.args.span_generation == "Start_end":
-            # 注意此处最大长度要加1的原因是在无效的span的mask由0表示  和其他的span长度结合在一起
+            # Note that the reason for adding 1 to the maximum length here is that the mask for invalid spans is represented by 0,
+            # combined with the lengths of the other spans
             self.step_1_embedding4width = nn.Embedding(args.max_span_length + 1, args.embedding_dim4width)
             self.step_1_linear4width = nn.Linear(args.embedding_dim4width + args.bert_feature_dim * 2,
                                                  args.bert_feature_dim)
@@ -210,9 +176,10 @@ class Step_1(torch.nn.Module):
         bert_feature = self.dropout_output(input_bert_features)
         features_mask_tensor = None
         if self.args.span_generation == "Average" or self.args.span_generation == "Max":
-            # 如果使用全部span的bert信息：
+            # If using all the span information of BERT：
             spans_num = spans.shape[1]
             spans_width_start_end = spans[:, :, 0:2].view(spans.size(0), spans_num, -1)
+            
             spans_width_start_end_embedding, spans_width_start_end_mask = batched_span_select(bert_feature,
                                                                                               spans_width_start_end)
             spans_width_start_end_mask = spans_width_start_end_mask.unsqueeze(-1).expand(-1, -1, -1,
@@ -226,7 +193,7 @@ class Step_1(torch.nn.Module):
                 spans_width_start_end_mean = spans_width_start_end_embedding.mean(dim=2, keepdim=True).squeeze(-2)
                 spans_embedding = spans_width_start_end_mean
         elif self.args.span_generation == "Start_end":
-            # 如果使用span区域大小进行embedding
+            # If using the span region size for embedding
             spans_start = spans[:, :, 0].view(spans.size(0), -1)
             spans_start_embedding = batched_index_select(bert_feature, spans_start)
             spans_end = spans[:, :, 1].view(spans.size(0), -1)
@@ -234,7 +201,7 @@ class Step_1(torch.nn.Module):
 
             spans_width = spans[:, :, 2].view(spans.size(0), -1)
             spans_width_embedding = self.step_1_embedding4width(spans_width)
-            spans_embedding = torch.cat((spans_start_embedding, spans_width_embedding, spans_end_embedding), dim=-1)  # 预留可修改部分
+            spans_embedding = torch.cat((spans_start_embedding, spans_width_embedding, spans_end_embedding), dim=-1)  # Reserve a modifiable section
             # spans_embedding_dict = torch.cat((spans_start_embedding, spans_end_embedding, spans_width_embedding), dim=-1)
             spans_embedding_dict = self.step_1_linear4width(spans_embedding)
             spans_embedding = spans_embedding_dict
@@ -277,8 +244,8 @@ class Dim_Four_Block(torch.nn.Module):
         self.intermediate = Intermediate(bert_config)
         self.output = Output(bert_config)
     def forward(self, hidden_embedding, masks, encoder_embedding):
-        #注意， mask需要和attention中的scores匹配，用来去掉对应的无意义的值
-        #对应的score的维度为 (batch_size, num_heads, hidden_dim, encoder_dim)
+        # Note that the mask needs to match the scores in the attention mechanism to remove the corresponding meaningless values
+        # The corresponding score's dimension is (batch_size, num_heads, hidden_dim, encoder_dim)
         masks = (~masks) * -1e9
         attention_masks = masks[:, :, None, None, :]
         cross_attention_output = self.forward_attn(hidden_states=hidden_embedding,
@@ -300,8 +267,8 @@ class Pointer_Block(torch.nn.Module):
         self.output = Output(bert_config)
         self.mask_for_encoder = mask_for_encoder
     def forward(self, hidden_embedding, masks, encoder_embedding):
-        #注意， mask需要和attention中的scores匹配，用来去掉对应的无意义的值
-        #对应的score的维度为 (batch_size, num_heads, hidden_dim, encoder_dim)
+        # Note that the mask needs to match the scores in the attention mechanism to remove the corresponding meaningless values
+        # The corresponding score's dimension is (batch_size, num_heads, hidden_dim, encoder_dim)
         masks = (~masks) * -1e9
         if masks.dim() == 3:
             attention_masks = masks[:, None, :, :]
@@ -369,7 +336,7 @@ def Loss(gold_aspect_label, pred_aspect_label, gold_opinion_label, pred_opinion_
     if cnn_spans_mask_tensor is not None:
         spans_mask_tensor = cnn_spans_mask_tensor
 
-    # Loss正向
+    # Loss forward
     aspect_spans_mask_tensor = spans_mask_tensor.view(-1) == 1
     pred_aspect_label_logits = pred_aspect_label.view(-1, pred_aspect_label.shape[-1])
     gold_aspect_effective_label = torch.where(aspect_spans_mask_tensor, gold_aspect_label.view(-1),
@@ -383,7 +350,7 @@ def Loss(gold_aspect_label, pred_aspect_label, gold_opinion_label, pred_opinion_
     opinion_loss = loss_function(pred_opinion_label_logits, gold_opinion_effective_label)
     as_2_op_loss = aspect_loss + opinion_loss
 
-    # Loss反向
+    # Loss backward
     reverse_opinion_span_mask_tensor = spans_mask_tensor.view(-1) == 1
     reverse_pred_opinion_label_logits = reverse_pred_opinion_label.view(-1, reverse_pred_opinion_label.shape[-1])
     reverse_gold_opinion_effective_label = torch.where(reverse_opinion_span_mask_tensor, reverse_gold_opinion_label.view(-1),
@@ -459,7 +426,7 @@ def compute_kl_loss(args, p, q, pad_mask=None):
         total_loss = math.log(1 + 5 / (cs_loss))
     else:
         total_loss = 0
-        print('损失种类错误')
+        print('Loss type error')
     return  total_loss
 
 
